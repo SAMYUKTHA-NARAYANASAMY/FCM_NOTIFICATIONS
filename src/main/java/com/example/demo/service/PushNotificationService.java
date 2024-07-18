@@ -1,56 +1,85 @@
 package com.example.demo.service;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.stereotype.Service;
-
-import com.google.firebase.database.DatabaseReference;
-import com.google.firebase.messaging.FirebaseMessaging;
-import com.google.firebase.messaging.FirebaseMessagingException;
-import com.google.firebase.messaging.Message;
-import com.google.firebase.messaging.Notification;
 import com.example.demo.model.NotificationRequest;
+import com.example.demo.model.User;
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutureCallback;
+import com.google.api.core.ApiFutures;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
 @Service
 public class PushNotificationService {
 
-  @Autowired
-  private DatabaseReference databaseReference;
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
 
-  public ResponseEntity<String> sendNotificationToAll(String title, String body) {
-    Message message = Message.builder()
-        .setNotification(Notification.builder()
-            .setTitle(title)
-            .setBody(body)
-            .build())
-        .setTopic("all")
-        .build();
+    @Autowired
+    private UserService userService;
 
-    try {
-      // Send the message via FCM
-      String response = FirebaseMessaging.getInstance().send(message);
-      System.out.println("Successfully sent message: " + response);
+    private final DatabaseReference databaseReference;
 
-      // Save notification details to Firebase Realtime Database
-      NotificationRequest notificationRequest = new NotificationRequest(title, body);
-      databaseReference.push().setValue(notificationRequest, (error, ref) -> {
-        if (error != null) {
-          System.err.println("Error saving data: " + error.getMessage());
-        } else {
-          System.out.println("Successfully saved data");
-        }
-      });
-
-      return ResponseEntity.ok("Successfully sent message: " + response);
-    } catch (FirebaseMessagingException e) {
-      e.printStackTrace();
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-          .body("Failed to send notification: " + e.getMessage());
-    } catch (Exception e) {
-      e.printStackTrace();
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-          .body("Unexpected error: " + e.getMessage());
+    public PushNotificationService() {
+        this.databaseReference = FirebaseDatabase.getInstance().getReference();
     }
-  }
+
+    public void sendNotification(NotificationRequest notificationRequest, User user) {
+        try {
+            sendToQueue(user.getUserId(), notificationRequest);
+            saveNotificationToFirebase(user.getUserId(), notificationRequest);
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.err.println("Failed to send notification: " + e.getMessage());
+        }
+    }
+
+    public void sendNotification(NotificationRequest notificationRequest) {
+        String userId = notificationRequest.getUserId();
+        if (userId != null) {
+            userService.getUserById(userId, new UserFetchCallback() {
+                @Override
+                public void onUserFetched(User user) {
+                    if (user == null) {
+                        System.err.println("User not found for ID: " + userId);
+                    } else {
+                        sendNotification(notificationRequest, user);
+                    }
+                }
+            });
+        } else {
+            System.err.println("User ID is null in the notification request.");
+        }
+    }
+
+    private void sendToQueue(String userId, NotificationRequest notificationRequest) {
+        rabbitTemplate.convertAndSend("notificationExchange", "notificationQueue", notificationRequest);
+        // Implement additional logic to send notification using userId if needed
+        System.out.println("Notification sent to queue for user: " + userId);
+    }
+
+    private void saveNotificationToFirebase(String userId, NotificationRequest notificationRequest) {
+        String notificationId = databaseReference.child("notifications").child(userId).push().getKey();
+        if (notificationId != null) {
+            ApiFuture<Void> future = databaseReference.child("notifications").child(userId).child(notificationId).setValueAsync(notificationRequest);
+
+            // Adding a listener to handle success and failure cases
+            ApiFutures.addCallback(future, new ApiFutureCallback<Void>() {
+                @Override
+                public void onSuccess(Void aVoid) {
+                    System.out.println("Notification saved in Firebase RTDB under user: " + userId + " with ID: " + notificationId);
+                }
+
+                @Override
+                public void onFailure(Throwable t) {
+                    System.err.println("Failed to save notification: " + t.getMessage());
+                }
+            }, MoreExecutors.directExecutor());
+        } else {
+            System.err.println("Failed to save notification in Firebase RTDB: Unable to generate ID");
+        }
+    }
 }
